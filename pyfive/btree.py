@@ -172,13 +172,25 @@ class BTreeV1RawDataChunks(BTreeV1):
                 chunk_buffer = zlib.decompress(chunk_buffer)
             elif filter_id == SHUFFLE_FILTER:
                 buffer_size = len(chunk_buffer)
+
+                # handle the case when fletcher bytes might exist at the end
+                # in that case, drop trailing non-element bytes
+                remainder = buffer_size % itemsize
+                remainder_byts = b""
+                if remainder:
+                    remainder_byts = chunk_buffer[-remainder:]
+                    chunk_buffer = chunk_buffer[:-remainder]
+                    buffer_size -= remainder
+
                 unshuffled_buffer = bytearray(buffer_size)
                 step = buffer_size // itemsize
                 for j in range(itemsize):
                     start = j * step
                     end = (j+1) * step
                     unshuffled_buffer[j::itemsize] = chunk_buffer[start:end]
-                chunk_buffer = unshuffled_buffer
+
+                # if remainder bytes where present, remember to add them to the end
+                chunk_buffer = unshuffled_buffer + remainder_byts
             elif filter_id == FLETCH32_FILTER:
                 cls._verify_fletcher32(chunk_buffer)
                 # strip off 4-byte checksum from end of buffer

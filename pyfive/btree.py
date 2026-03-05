@@ -1,13 +1,15 @@
 """HDF5 B-Trees and contents."""
 
 from collections import OrderedDict
+from functools import lru_cache
 import struct
-import zlib
 
 import numpy as np
 
 from .core import _unpack_struct_from_file
 from .core import _unpack_struct_from
+
+from numcodecs import Fletcher32, Shuffle, Zlib
 
 
 class AbstractBTree(object):
@@ -160,46 +162,97 @@ class BTreeV1RawDataChunks(BTreeV1):
 
     @classmethod
     def _filter_chunk(cls, chunk_buffer, filter_mask, filter_pipeline, itemsize):
-        """Apply decompression filters to a chunk of data."""
-        num_filters = len(filter_pipeline)
-        for i, pipeline_entry in enumerate(filter_pipeline[::-1]):
-            # A filter is skipped is the bit corresponding to its index in the
-            # pipeline is set in filter_mask
+        """Apply decompression filters to a chunk of data.
+
+        This uses `numcodecs` for the built-in filters we support (deflate/zlib,
+        shuffle, fletcher32) to avoid Python-level loops.
+        """
+        if not filter_pipeline:
+            return chunk_buffer
+
+        signature = tuple(
+            (
+                int(entry["filter_id"]),
+                tuple(int(x) for x in entry.get("client_data", ())),
+            )
+            for entry in filter_pipeline
+        )
+        pipeline = cls._get_numcodecs_pipeline(signature, int(itemsize))
+        num_filters = len(pipeline)
+
+        # Filters are applied in reverse order on read.
+        for i, (filter_id, codec) in enumerate(pipeline[::-1]):
             filter_index = num_filters - i - 1  # 0 to num_filters - 1
             if filter_mask & (1 << filter_index):
                 continue
 
-            filter_id = pipeline_entry["filter_id"]
-            if filter_id == GZIP_DEFLATE_FILTER:
-                chunk_buffer = zlib.decompress(chunk_buffer)
-            elif filter_id == SHUFFLE_FILTER:
-                buffer_size = len(chunk_buffer)
-                unshuffled_buffer = bytearray(buffer_size)
-                step = buffer_size // itemsize
-                for j in range(itemsize):
-                    start = j * step
-                    end = (j + 1) * step
-                    unshuffled_buffer[j::itemsize] = chunk_buffer[start:end]
-                chunk_buffer = unshuffled_buffer
-            elif filter_id == FLETCH32_FILTER:
-                cls._verify_fletcher32(chunk_buffer)
-                # strip off 4-byte checksum from end of buffer
-                chunk_buffer = chunk_buffer[:-4]
-            elif filter_id == LZF_FILTER:
-                try:
-                    import lzf
-                except ImportError as e:
-                    raise ModuleNotFoundError(
-                        "LZF codec requires optional package 'python-neo-lzf'."
-                        "Could be installed from conda-forge or PyPI."
-                    ) from e
-                uncompressed_len = struct.unpack(">H", chunk_buffer[:2])[0]
-                chunk_buffer = lzf.decompress(chunk_buffer, uncompressed_len)
-            else:
-                raise NotImplementedError(
-                    "Filter with id: %i import not supported" % (filter_id)
-                )
+            if codec is None:
+                # Not represented by numcodecs (e.g. LZF) or explicitly skipped
+                if filter_id == LZF_FILTER:
+                    try:
+                        import lzf  # type: ignore[import-not-found]
+                    except ImportError as e:
+                        raise ModuleNotFoundError(
+                            "LZF codec requires optional package 'python-lzf' "
+                            "(or compatible 'lzf' module)."
+                        ) from e
+                    buf = bytes(chunk_buffer)
+                    uncompressed_len = struct.unpack(">H", buf[:2])[0]
+                    chunk_buffer = lzf.decompress(buf, uncompressed_len)
+                    continue
+                raise NotImplementedError(f"Filter with id: {filter_id} is not supported")
+
+            # numcodecs codecs accept any buffer-providing object; decode may return
+            # bytes, memoryview slices, or numpy arrays (all buffer-compatible).
+            chunk_buffer = codec.decode(chunk_buffer)
+
         return chunk_buffer
+
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _get_numcodecs_pipeline(signature: tuple, itemsize: int):
+        """
+        Build and cache a numcodecs pipeline for this filter sequence.
+
+        Returns a list aligned with the HDF5 filter pipeline order, where each
+        entry is a pair `(filter_id, codec)` and `codec` is either a numcodecs
+        codec instance (for supported filters) or None (for unsupported filters
+        handled separately).
+        """
+        pipeline: list[tuple[int, object | None]] = []
+
+        for filter_id, client_data in signature:
+            if filter_id == GZIP_DEFLATE_FILTER:
+                # HDF5 deflate is zlib/deflate. client_data[0] is typically the level.
+                level = None
+                if client_data:
+                    try:
+                        level = int(client_data[0])
+                    except Exception:
+                        level = None
+                codec = Zlib(level=level) if level is not None else Zlib()
+                pipeline.append((filter_id, codec))
+            elif filter_id == SHUFFLE_FILTER:
+                # HDF5 shuffle uses the element size (usually dtype.itemsize).
+                # Some files store this as client_data[0]; prefer that if sane.
+                shuffle_size = itemsize
+                if client_data:
+                    try:
+                        v = int(client_data[0])
+                        if v > 0:
+                            shuffle_size = v
+                    except Exception:
+                        pass
+                pipeline.append((filter_id, Shuffle(int(shuffle_size))))
+            elif filter_id == FLETCH32_FILTER:
+                pipeline.append((filter_id, Fletcher32()))
+            elif filter_id == LZF_FILTER:
+                # numcodecs doesn't provide HDF5 LZF; handled via optional `lzf` module.
+                pipeline.append((filter_id, None))
+            else:
+                raise NotImplementedError(f"Filter with id: {filter_id} is not supported")
+
+        return pipeline
 
     @staticmethod
     def _verify_fletcher32(chunk_buffer):

@@ -13,6 +13,10 @@ from pyfive.misc_low_level import (
 from pyfive.p5t import P5CompoundType, P5VlenStringType, P5ReferenceType, P5SequenceType
 from io import UnsupportedOperation
 from time import time
+import os
+import threading
+import itertools
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 import struct
 import logging
@@ -77,6 +81,11 @@ class DatasetID:
             #  No file descriptor => Not Posix
             self.posix = False
             self.__fh = fh
+            self._io_lock = threading.Lock()
+            # Common for fsspec-backed file objects (e.g. S3): allow opening
+            # independent handles for parallel ranged reads.
+            self._remote_fs = getattr(fh, "fs", None)
+            self._remote_path = getattr(fh, "path", None)
             self.pseudo_chunking_size = pseudo_chunking_size_MB * 1024 * 1024
             try:
                 # maybe this is an S3File instance?
@@ -95,6 +104,9 @@ class DatasetID:
             self.posix = True
             self._filename = fh.name
             self.pseudo_chunking_size = 0
+            self._io_lock = None
+            self._remote_fs = None
+            self._remote_path = None
 
         self.filter_pipeline = dataobject.filter_pipeline
         self.shape = dataobject.shape
@@ -624,13 +636,59 @@ class DatasetID:
         """
         Obtain the bytes associated with a chunk.
         """
-        fh = self._fh
-        fh.seek(storeinfo.byte_offset)
-        out = fh.read(storeinfo.size)
         if self.posix:
-            fh.close()
+            fh = self._fh
+            try:
+                fh.seek(storeinfo.byte_offset)
+                return fh.read(storeinfo.size)
+            finally:
+                fh.close()
 
-        return out
+        # Non-posix: use remote fs if available, else serialize access
+        if self._remote_fs is not None and self._remote_path is not None:
+            fh = self._remote_fs.open(self._remote_path, "rb")
+            try:
+                fh.seek(storeinfo.byte_offset)
+                return fh.read(storeinfo.size)
+            finally:
+                fh.close()
+
+        # Fallback: shared file handle (may not be thread-safe without locking)
+        if self._io_lock is None:
+            # Shouldn't happen, but keep safe defaults
+            fh = self._fh
+            fh.seek(storeinfo.byte_offset)
+            return fh.read(storeinfo.size)
+        with self._io_lock:
+            self.__fh.seek(storeinfo.byte_offset)
+            return self.__fh.read(storeinfo.size)
+
+    @staticmethod
+    def _env_int(name: str):
+        v = os.getenv(name)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except ValueError:
+            return None
+
+    def _chunk_read_workers(self) -> int:
+        """
+        Number of threads used to fetch/decode chunks when slicing chunked datasets.
+
+        Configure via environment variable `PYFIVE_CHUNK_READ_THREADS`.
+        Set to 1 to force serial behavior.
+        """
+        configured = self._env_int("PYFIVE_CHUNK_READ_THREADS")
+        if configured is not None:
+            return max(1, configured)
+
+        # Heuristic: chunk reads are I/O-heavy, so default higher than CPU count.
+        ncpu = os.cpu_count() or 4
+        if self.posix:
+            return min(32, max(4, ncpu * 4))
+        return min(64, max(8, ncpu * 8))
 
     def _get_selection_via_chunks(self, args):
         """Use the zarr orthogonal indexer to extract data for a specfic
@@ -679,23 +737,91 @@ class DatasetID:
                 fh.close()
 
         else:
-            for chunk_coords, chunk_selection, out_selection in indexer:
-                # map from chunk coordinate space to array space which
-                # is how hdf5 keeps the index
-                chunk_coords = tuple(map(mul, chunk_coords, self.chunks))
-                filter_mask, chunk_buffer = self.read_direct_chunk(chunk_coords)
-                if self.filter_pipeline is not None:
-                    # we are only using the class method here, future
-                    # filter pipelines may need their own function
-                    chunk_buffer = BTreeV1RawDataChunks._filter_chunk(
-                        chunk_buffer,
-                        filter_mask,
-                        self.filter_pipeline,
-                        self.dtype.itemsize,
-                    )
-                chunk_data = np.frombuffer(chunk_buffer, dtype=dtype)
-                chunk_data = chunk_data.reshape(self.chunks, order=self._order)
-                out[out_selection] = chunk_data[chunk_selection]
+            # Parallelize chunk transfers + decode; keep writes to `out` on main thread.
+            workers = self._chunk_read_workers()
+
+            it = iter(indexer)
+            first = next(it, None)
+            if first is None:
+                return out
+            second = next(it, None)
+            if workers <= 1 or second is None:
+                # Serial fast-path (avoids thread-pool overhead for single-chunk reads).
+                for chunk_coords, chunk_selection, out_selection in itertools.chain(
+                    [first], ([] if second is None else [second]), it
+                ):
+                    chunk_coords = tuple(map(mul, chunk_coords, self.chunks))
+                    filter_mask, chunk_buffer = self.read_direct_chunk(chunk_coords)
+                    if self.filter_pipeline is not None:
+                        chunk_buffer = BTreeV1RawDataChunks._filter_chunk(
+                            chunk_buffer,
+                            filter_mask,
+                            self.filter_pipeline,
+                            self.dtype.itemsize,
+                        )
+                    chunk_data = np.frombuffer(chunk_buffer, dtype=dtype)
+                    chunk_data = chunk_data.reshape(self.chunks, order=self._order)
+                    out[out_selection] = chunk_data[chunk_selection]
+            else:
+                # Use a bounded in-flight queue to saturate bandwidth without unbounded RAM use.
+                max_in_flight = max(8, workers * 4)
+                index = self._index
+                if index is None:
+                    raise RuntimeError("Attempt to read chunked data with no index")
+
+                filter_pipeline = self.filter_pipeline
+                chunks = self.chunks
+                order = self._order
+                itemsize = self.dtype.itemsize
+
+                # POSIX optimization: open a single fd and use pread (seek-free, thread-safe).
+                fd = None
+                if self.posix:
+                    fd = os.open(self._filename, os.O_RDONLY)
+
+                def fetch_decode(chunk_coords, chunk_selection, out_selection):
+                    # map from chunk coordinate space to array space which is how hdf5 keeps the index
+                    coords = tuple(map(mul, chunk_coords, chunks))
+                    storeinfo = index[coords]
+                    filter_mask = storeinfo.filter_mask
+                    if fd is not None:
+                        chunk_buffer = os.pread(fd, storeinfo.size, storeinfo.byte_offset)
+                    else:
+                        chunk_buffer = self._get_raw_chunk(storeinfo)
+                    if filter_pipeline is not None:
+                        chunk_buffer = BTreeV1RawDataChunks._filter_chunk(
+                            chunk_buffer,
+                            filter_mask,
+                            filter_pipeline,
+                            itemsize,
+                        )
+                    chunk_data = np.frombuffer(chunk_buffer, dtype=dtype)
+                    chunk_data = chunk_data.reshape(chunks, order=order)
+                    return out_selection, chunk_data[chunk_selection]
+
+                pending = set()
+                try:
+                    with ThreadPoolExecutor(max_workers=workers) as ex:
+                        for req in itertools.chain([first, second], it):
+                            pending.add(ex.submit(fetch_decode, *req))
+                            if len(pending) >= max_in_flight:
+                                done, pending = wait(
+                                    pending, return_when=FIRST_COMPLETED
+                                )
+                                for fut in done:
+                                    out_selection, data = fut.result()
+                                    out[out_selection] = data
+
+                        while pending:
+                            done, pending = wait(
+                                pending, return_when=FIRST_COMPLETED
+                            )
+                            for fut in done:
+                                out_selection, data = fut.result()
+                                out[out_selection] = data
+                finally:
+                    if fd is not None:
+                        os.close(fd)
 
         if isinstance(self._ptype, P5ReferenceType):
             to_reference = np.vectorize(Reference)

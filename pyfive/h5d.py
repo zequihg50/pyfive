@@ -16,11 +16,12 @@ from time import time
 import os
 import threading
 import itertools
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor
 
 import struct
 import logging
 from importlib.metadata import version
+from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
@@ -644,14 +645,17 @@ class DatasetID:
             finally:
                 fh.close()
 
-        # Non-posix: use remote fs if available, else serialize access
-        if self._remote_fs is not None and self._remote_path is not None:
-            fh = self._remote_fs.open(self._remote_path, "rb")
-            try:
-                fh.seek(storeinfo.byte_offset)
-                return fh.read(storeinfo.size)
-            finally:
-                fh.close()
+        # Non-posix: HTTP(S) via plain urllib, otherwise fall back to shared handle.
+        if (
+            isinstance(self._filename, str)
+            and self._filename.startswith(("http://", "https://"))
+        ):
+            start = int(storeinfo.byte_offset)
+            end = start + int(storeinfo.size) - 1
+            headers = {"Range": f"bytes={start}-{end}"}
+            req = Request(self._filename, headers=headers, method="GET")
+            with urlopen(req) as resp:
+                return resp.read()
 
         # Fallback: shared file handle (may not be thread-safe without locking)
         if self._io_lock is None:
@@ -738,90 +742,57 @@ class DatasetID:
 
         else:
             # Parallelize chunk transfers + decode; keep writes to `out` on main thread.
-            workers = self._chunk_read_workers()
+            workers = max(1, self._chunk_read_workers())
 
-            it = iter(indexer)
-            first = next(it, None)
-            if first is None:
+            # Materialize all chunk requests so we can fan them out to workers
+            # without imposing any artificial in-flight limit.
+            requests = list(indexer)
+            if not requests:
                 return out
-            second = next(it, None)
-            if workers <= 1 or second is None:
-                # Serial fast-path (avoids thread-pool overhead for single-chunk reads).
-                for chunk_coords, chunk_selection, out_selection in itertools.chain(
-                    [first], ([] if second is None else [second]), it
-                ):
-                    chunk_coords = tuple(map(mul, chunk_coords, self.chunks))
-                    filter_mask, chunk_buffer = self.read_direct_chunk(chunk_coords)
-                    if self.filter_pipeline is not None:
-                        chunk_buffer = BTreeV1RawDataChunks._filter_chunk(
-                            chunk_buffer,
-                            filter_mask,
-                            self.filter_pipeline,
-                            self.dtype.itemsize,
-                        )
-                    chunk_data = np.frombuffer(chunk_buffer, dtype=dtype)
-                    chunk_data = chunk_data.reshape(self.chunks, order=self._order)
-                    out[out_selection] = chunk_data[chunk_selection]
-            else:
-                # Use a bounded in-flight queue to saturate bandwidth without unbounded RAM use.
-                max_in_flight = max(8, workers * 4)
-                index = self._index
-                if index is None:
-                    raise RuntimeError("Attempt to read chunked data with no index")
 
-                filter_pipeline = self.filter_pipeline
-                chunks = self.chunks
-                order = self._order
-                itemsize = self.dtype.itemsize
+            index = self._index
+            if index is None:
+                raise RuntimeError("Attempt to read chunked data with no index")
 
-                # POSIX optimization: open a single fd and use pread (seek-free, thread-safe).
-                fd = None
-                if self.posix:
-                    fd = os.open(self._filename, os.O_RDONLY)
+            filter_pipeline = self.filter_pipeline
+            chunks = self.chunks
+            order = self._order
+            itemsize = self.dtype.itemsize
 
-                def fetch_decode(chunk_coords, chunk_selection, out_selection):
-                    # map from chunk coordinate space to array space which is how hdf5 keeps the index
-                    coords = tuple(map(mul, chunk_coords, chunks))
-                    storeinfo = index[coords]
-                    filter_mask = storeinfo.filter_mask
-                    if fd is not None:
-                        chunk_buffer = os.pread(fd, storeinfo.size, storeinfo.byte_offset)
-                    else:
-                        chunk_buffer = self._get_raw_chunk(storeinfo)
-                    if filter_pipeline is not None:
-                        chunk_buffer = BTreeV1RawDataChunks._filter_chunk(
-                            chunk_buffer,
-                            filter_mask,
-                            filter_pipeline,
-                            itemsize,
-                        )
-                    chunk_data = np.frombuffer(chunk_buffer, dtype=dtype)
-                    chunk_data = chunk_data.reshape(chunks, order=order)
-                    return out_selection, chunk_data[chunk_selection]
+            # POSIX optimization: open a single fd and use pread (seek-free, thread-safe).
+            fd = None
+            if self.posix:
+                fd = os.open(self._filename, os.O_RDONLY)
 
-                pending = set()
-                try:
-                    with ThreadPoolExecutor(max_workers=workers) as ex:
-                        for req in itertools.chain([first, second], it):
-                            pending.add(ex.submit(fetch_decode, *req))
-                            if len(pending) >= max_in_flight:
-                                done, pending = wait(
-                                    pending, return_when=FIRST_COMPLETED
-                                )
-                                for fut in done:
-                                    out_selection, data = fut.result()
-                                    out[out_selection] = data
+            def fetch_decode(chunk_coords, chunk_selection, out_selection):
+                # Map from chunk coordinate space to array space which is how HDF5 keeps the index.
+                coords = tuple(map(mul, chunk_coords, chunks))
+                storeinfo = index[coords]
+                filter_mask = storeinfo.filter_mask
+                if fd is not None:
+                    chunk_buffer = os.pread(fd, storeinfo.size, storeinfo.byte_offset)
+                else:
+                    chunk_buffer = self._get_raw_chunk(storeinfo)
+                if filter_pipeline is not None:
+                    chunk_buffer = BTreeV1RawDataChunks._filter_chunk(
+                        chunk_buffer,
+                        filter_mask,
+                        filter_pipeline,
+                        itemsize,
+                    )
+                chunk_data = np.frombuffer(chunk_buffer, dtype=dtype)
+                chunk_data = chunk_data.reshape(chunks, order=order)
+                return out_selection, chunk_data[chunk_selection]
 
-                        while pending:
-                            done, pending = wait(
-                                pending, return_when=FIRST_COMPLETED
-                            )
-                            for fut in done:
-                                out_selection, data = fut.result()
-                                out[out_selection] = data
-                finally:
-                    if fd is not None:
-                        os.close(fd)
+            try:
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futures = [ex.submit(fetch_decode, *req) for req in requests]
+                    for fut in futures:
+                        out_selection, data = fut.result()
+                        out[out_selection] = data
+            finally:
+                if fd is not None:
+                    os.close(fd)
 
         if isinstance(self._ptype, P5ReferenceType):
             to_reference = np.vectorize(Reference)

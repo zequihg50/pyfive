@@ -111,10 +111,15 @@ class DatasetID:
             self._remote_fs = None
             self._remote_path = None
 
+        # Cached worker count for chunk reads (so that HTTP pool and
+        # executor sizing remain consistent for the lifetime of this dataset).
+        self._chunk_worker_count = None
+
         # HTTP connection pool for remote chunk reads (non-posix HTTP/HTTPS paths).
         self._http_pool = None
         self._http_pool_lock = threading.Lock()
         self._http_path = None
+        self._http_pool_size = 0
 
         self.filter_pipeline = dataobject.filter_pipeline
         self.shape = dataobject.shape
@@ -385,22 +390,11 @@ class DatasetID:
             pool_size = 1
 
         with self._http_pool_lock:
-            current_pool = self._http_pool
-            if isinstance(current_pool, queue.LifoQueue) and current_pool.qsize() == pool_size:
+            # If we've already built a pool, keep using it. The worker count
+            # is cached, so we don't expect pool_size to change during the
+            # lifetime of this DatasetID.
+            if isinstance(self._http_pool, queue.LifoQueue):
                 return
-
-            # Tear down any existing connections.
-            if isinstance(current_pool, queue.LifoQueue):
-                try:
-                    while True:
-                        conn = current_pool.get_nowait()
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-                except Exception:
-                    # Queue exhausted or error; ignore and rebuild.
-                    pass
 
             parsed = urlsplit(self._filename)
             conn_cls = (
@@ -412,6 +406,7 @@ class DatasetID:
                 pool.put(conn_cls(parsed.netloc))
 
             self._http_pool = pool
+            self._http_pool_size = pool_size
             path = parsed.path or "/"
             if parsed.query:
                 path = f"{path}?{parsed.query}"
@@ -421,7 +416,7 @@ class DatasetID:
         """
         Fetch a byte-range from a remote HTTP(S) resource using the connection pool.
         """
-        # Align pool size with the chunk-read worker count.
+        # Align pool size with the chunk-read worker count (cached per DatasetID).
         self._ensure_http_pool(self._chunk_read_workers())
 
         pool = self._http_pool
@@ -792,15 +787,21 @@ class DatasetID:
         Configure via environment variable `PYFIVE_CHUNK_READ_THREADS`.
         Set to 1 to force serial behavior.
         """
+        if self._chunk_worker_count is not None:
+            return self._chunk_worker_count
+
         configured = self._env_int("PYFIVE_CHUNK_READ_THREADS")
         if configured is not None:
-            return max(1, configured)
+            self._chunk_worker_count = max(1, configured)
+            return self._chunk_worker_count
 
         # Heuristic: chunk reads are I/O-heavy, so default higher than CPU count.
         ncpu = os.cpu_count() or 4
         if self.posix:
-            return min(32, max(4, ncpu * 4))
-        return min(64, max(8, ncpu * 8))
+            self._chunk_worker_count = min(32, max(4, ncpu * 4))
+        else:
+            self._chunk_worker_count = min(64, max(8, ncpu * 8))
+        return self._chunk_worker_count
 
     def _get_selection_via_chunks(self, args):
         """Use the zarr orthogonal indexer to extract data for a specfic

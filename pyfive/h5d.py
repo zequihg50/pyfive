@@ -21,7 +21,9 @@ from concurrent.futures import ThreadPoolExecutor
 import struct
 import logging
 from importlib.metadata import version
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+import http.client
+import queue
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +110,11 @@ class DatasetID:
             self._io_lock = None
             self._remote_fs = None
             self._remote_path = None
+
+        # HTTP connection pool for remote chunk reads (non-posix HTTP/HTTPS paths).
+        self._http_pool = None
+        self._http_pool_lock = threading.Lock()
+        self._http_path = None
 
         self.filter_pipeline = dataobject.filter_pipeline
         self.shape = dataobject.shape
@@ -363,6 +370,110 @@ class DatasetID:
         else:
             coord_index = tuple(map(mul, chunk_coords, self.chunks))
             return self.get_chunk_info_by_coord(coord_index)
+
+    def _ensure_http_pool(self, pool_size: int):
+        """
+        Lazily initialize or resize the HTTP(S) connection pool for remote chunk reads.
+        Pool size is typically chosen to match the number of chunk-read worker threads.
+        """
+        if not isinstance(self._filename, str) or not self._filename.startswith(
+            ("http://", "https://")
+        ):
+            return
+
+        if pool_size <= 0:
+            pool_size = 1
+
+        with self._http_pool_lock:
+            current_pool = self._http_pool
+            if isinstance(current_pool, queue.LifoQueue) and current_pool.qsize() == pool_size:
+                return
+
+            # Tear down any existing connections.
+            if isinstance(current_pool, queue.LifoQueue):
+                try:
+                    while True:
+                        conn = current_pool.get_nowait()
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    # Queue exhausted or error; ignore and rebuild.
+                    pass
+
+            parsed = urlsplit(self._filename)
+            conn_cls = (
+                http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+            )
+
+            pool = queue.LifoQueue()
+            for _ in range(pool_size):
+                pool.put(conn_cls(parsed.netloc))
+
+            self._http_pool = pool
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+            self._http_path = path
+
+    def _http_range_read(self, start: int, size: int) -> bytes:
+        """
+        Fetch a byte-range from a remote HTTP(S) resource using the connection pool.
+        """
+        # Align pool size with the chunk-read worker count.
+        self._ensure_http_pool(self._chunk_read_workers())
+
+        pool = self._http_pool
+        if not isinstance(pool, queue.LifoQueue) or self._http_path is None:
+            # Fallback: no pool available, nothing to do here.
+            raise RuntimeError("HTTP pool not initialized for remote chunk read")
+
+        end = start + size - 1
+        headers = {
+            "Range": f"bytes={int(start)}-{int(end)}",
+        }
+
+        # Get a connection from the pool (blocks if all are in use).
+        conn = pool.get()
+        try:
+            try:
+                conn.putrequest("GET", self._http_path)
+                for k, v in headers.items():
+                    conn.putheader(k, v)
+                conn.endheaders()
+                resp = conn.getresponse()
+            except Exception:
+                # Connection may be stale; replace it and retry once.
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                parsed = urlsplit(self._filename)
+                conn_cls = (
+                    http.client.HTTPSConnection
+                    if parsed.scheme == "https"
+                    else http.client.HTTPConnection
+                )
+                conn = conn_cls(parsed.netloc)
+                conn.putrequest("GET", self._http_path)
+                for k, v in headers.items():
+                    conn.putheader(k, v)
+                conn.endheaders()
+                resp = conn.getresponse()
+
+            data = resp.read()
+            resp.close()
+            return data
+        finally:
+            # Always return the connection to the pool for reuse.
+            try:
+                pool.put(conn)
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     ######
     # The following DatasetID methods are used by PyFive and you wouldn't expect
@@ -645,17 +756,14 @@ class DatasetID:
             finally:
                 fh.close()
 
-        # Non-posix: HTTP(S) via plain urllib, otherwise fall back to shared handle.
+        # Non-posix: HTTP(S) via pooled HTTP connections, otherwise fall back to shared handle.
         if (
             isinstance(self._filename, str)
             and self._filename.startswith(("http://", "https://"))
         ):
             start = int(storeinfo.byte_offset)
-            end = start + int(storeinfo.size) - 1
-            headers = {"Range": f"bytes={start}-{end}"}
-            req = Request(self._filename, headers=headers, method="GET")
-            with urlopen(req) as resp:
-                return resp.read()
+            size = int(storeinfo.size)
+            return self._http_range_read(start, size)
 
         # Fallback: shared file handle (may not be thread-safe without locking)
         if self._io_lock is None:
